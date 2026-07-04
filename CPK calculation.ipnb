@@ -1,0 +1,117 @@
+from os import getenv
+import pymssql
+import pandas as pd
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+from scipy import stats
+import datetime
+from domo import DomoConnector
+warnings.filterwarnings("ignore")
+
+
+#Drop NA value in TuftRetention
+
+def preprocessing(df, freq = 'month'):
+    df['Machine & Bundle']=df['MachineName']+ "-" + df['ProductName']
+    df_clean=df.loc[df['TuftRetention']!='']
+    df_clean['TuftRetention']=df_clean['TuftRetention'].apply(float)
+    df_pivot=df_clean.groupby(by=['Machine & Bundle'])[['TuftRetention']].count().reset_index()
+    if freq == 'month':
+        df_pivot=df_pivot[df_pivot['TuftRetention']>=100]
+    df = pd.merge(df_clean,df_pivot,how='inner',on='Machine & Bundle')
+    df.rename(columns={"TuftRetention_x": "TuftRetention", "TuftRetention_y": "Count"}, inplace = True)
+    # get all bundle name
+    machine_bundle = list(df_pivot['Machine & Bundle'])
+    return df, machine_bundle
+
+
+def cal_cpk(data, lsl=2):
+    '''
+        calculate cpk, ppk
+        - with unconstant subgroup size
+        - use r bar method following: https://support.minitab.com/en-us/minitab/21/help-and-how-to/quality-and-process-improvement/control-charts/how-to/variables-charts-for-subgroups/xbar-r-chart/methods-and-formulas/estimating-sigma/ 
+        - use unbiasing constant d2,d3
+    '''
+    m = np.mean(data['TuftRetention'])
+
+    d2 = {1: 0, 2: 1.128, 3: 1.693, 4: 2.059, 5: 2.326}
+    d3 = {1: 1, 2: 0.8525, 3: 0.8884, 4: 0.8798, 5: 0.8641}
+    f_sum = 0
+    rbar_sum = 0
+    for i in data['group'].unique():
+        subgroup = data[data['group']==i]['TuftRetention']
+        subgroup.dropna(inplace=True)
+        r = (subgroup.max() - subgroup.min())
+        l = len(subgroup)
+        f = (d2[l]**2)/(d3[l]**2)
+        f_sum += f
+        rbar = (r*f)/(d2[l])
+        rbar_sum += rbar 
+
+    sigma1 = rbar_sum/f_sum
+    
+    if lsl is not None:
+        Cpl = float(m - lsl) / (3*sigma1)
+        Cpk = Cpl
+
+    sigma2 = stats.tstd(data['TuftRetention'])
+    if lsl is not None:
+        Ppl = float(m - lsl) / (3*sigma2)
+        Ppk = Ppl
+    return Cpk, Ppk
+
+def calculate(df, machine_bundle, frequency =None, remove_outlier = False, month = None, year = None, date = None):
+
+    result = pd.DataFrame(columns = ['machine', 'bundle','Cpk', 'Ppk', 'SoLuong'])
+    for mb in machine_bundle:
+        
+        temp_df = df[df['Machine & Bundle']==mb]
+        ## Add group name each 5 samples
+        group = []
+        for i in range(len(temp_df)//5):
+            for j in range(5):
+                group.append(i)
+        print(temp_df.shape)
+        temp_df['group'] = group
+        # print(temp_df)
+
+        if remove_outlier == True:
+            arr = temp_df['TuftRetention'].values
+            Q1 = np.percentile(arr, 25, interpolation = 'weibull')
+            Q3 = np.percentile(arr, 75, interpolation = 'weibull')
+            IQR = Q3 - Q1
+            temp_df =  temp_df[~((temp_df['TuftRetention'] <= (Q1-1.5*IQR)) | (temp_df['TuftRetention'] >= (Q3+1.5*IQR)))]
+            # temp_df = temp_df[(np.abs(stats.zscore(temp_df['TuftRetention_x'])) < 2.5)]
+ 
+        Cpk, Ppk = cal_cpk(temp_df)
+        try:
+            count = list(temp_df['Count'])[0]
+        except:
+            count = 0
+        result = result.append({'machine': mb.split('-')[0], 'bundle': mb.split('-')[1], 'Cpk': Cpk, 'Ppk': Ppk, 'SoLuong': count//5}, ignore_index = True)
+    result['cpk/ppk'] = result['Cpk']/result['Ppk']
+    if frequency == 'monthly':
+        result['Date'] = str(month-1) + '-/' + str(year)
+    else:   
+        result['Date'] = date
+    result.loc[result[(result['Ppk'] >= 0.995) & (result['cpk/ppk'] < 1.336)].index,'type'] = 'green'
+    result.loc[result[(result['Ppk'] < 0.995) & (result['cpk/ppk'] > 1.336)].index,'type'] = 'red'
+    result.loc[result[(result['Ppk'] < 0.995) & (result['cpk/ppk'] <= 1.336)].index,'type'] = 'orange'
+    result.loc[result[(result['Ppk'] > 0.995) & (result['cpk/ppk'] > 1.336)].index,'type'] = 'yellow'
+    return result
+
+def df2domo(df_extract, data_set_id, clientId, clientSecret, freq = None):
+    domo_client = DomoConnector(clientId, clientSecret)
+    data = []
+    for i in range(len(df_extract)):
+        dicti = df_extract.iloc[i].to_dict()
+        data.append(dicti)
+    if freq == 'daily':
+        domo_client.update(data_set_id= data_set_id, json_data= data) # replace
+    else:
+        domo_client.append(data_set_id= data_set_id, json_data= data) # append
+
+
